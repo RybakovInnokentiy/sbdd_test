@@ -23,19 +23,56 @@
 #define SBDD_SECTOR_SIZE        (1 << SBDD_SECTOR_SHIFT)
 #define SBDD_MIB_SECTORS        (1 << (20 - SBDD_SECTOR_SHIFT))
 #define SBDD_NAME               "sbdd"
+#define TARGET_NAME_LEN         50
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
 	spinlock_t              datalock;
 	atomic_t                deleting;
+    atomic_t                redirecting;
 	atomic_t                refs_cnt;
 	sector_t                capacity;
 	u8                      *data;
 	struct gendisk          *gd;
+    struct bdev_handle      *target_bdev_hdl; 
+    struct block_device     *target_bdev;
 };
 
 static struct sbdd              __sbdd = { 0 };
 static unsigned long            __sbdd_capacity_mib = 100;
+
+static bool redirect_to_target;
+static bool target_registered;
+
+static char __target_bdev_name[TARGET_NAME_LEN];
+
+static void target_bdev_end_bio(struct bio *bio) {
+    struct bio *orig_bio = bio->bi_private;
+    if (orig_bio) {
+        orig_bio->bi_status = bio->bi_status;
+        bio_endio(orig_bio);
+    }
+
+    bio_put(bio);
+}
+
+static int __always_inline sbdd_bio_prepare(struct bio **bio) {
+    *bio = bio_split_to_limits(*bio);
+	if (!(*bio))
+		return EAGAIN;
+
+    if (atomic_read(&__sbdd.deleting) || atomic_read(&__sbdd.redirecting)) {
+        bio_io_error(*bio);
+        return EAGAIN;
+    }
+
+    if (!atomic_inc_not_zero(&__sbdd.refs_cnt)) {
+        bio_io_error(*bio);
+        return EAGAIN;
+    }
+    
+    return 0;
+}
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -65,45 +102,56 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	return len;
 }
 
-static void sbdd_submit_bio(struct bio *bio)
+static void sbdd_submit_bio_ram(struct bio *bio) 
 {
 	struct bvec_iter iter;
 	struct bio_vec bvec;
 	int dir;
 	sector_t pos;
 
-	bio = bio_split_to_limits(bio);
-	if (!bio)
-		return;
+    int ret = sbdd_bio_prepare(&bio);
+    if (ret) {
+        pr_err("Can't prepare bio: %d. Retrying...\n", ret);
+        return;
+    }
 
-	if (atomic_read(&__sbdd.deleting)) {
-		bio_io_error(bio);
-		return;
-	}
+    dir = bio_data_dir(bio);
+    pos = bio->bi_iter.bi_sector;
+    bio_for_each_segment(bvec, bio, iter)
+        pos += sbdd_xfer(&bvec, pos, dir);
 
-	if (!atomic_inc_not_zero(&__sbdd.refs_cnt)) {
-		bio_io_error(bio);
-		return;
-	}
+    bio_endio(bio);
 
-	dir = bio_data_dir(bio);
-	pos = bio->bi_iter.bi_sector;
-	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
-
-	bio_endio(bio);
-
-	if (atomic_dec_and_test(&__sbdd.refs_cnt))
-		wake_up(&__sbdd.exitwait);
+    if (atomic_dec_and_test(&__sbdd.refs_cnt))
+        wake_up(&__sbdd.exitwait);
 }
 
-/*
-There are no read or write operations. These operations are performed by
-the request() function associated with the request queue of the disk.
-*/
-static struct block_device_operations const __sbdd_bdev_ops = {
+static void sbdd_submit_bio_target(struct bio *bio) 
+{
+    int ret = sbdd_bio_prepare(&bio);
+    if (ret) {
+        pr_err("Can't prepare bio: %d. Retrying...\n", ret);
+        return;
+    }
+
+    struct bio *bio_redirect = bio_alloc_clone(__sbdd.target_bdev, bio, GFP_NOIO, \
+                                    &__sbdd.target_bdev->bd_disk->bio_split);
+    bio_redirect->bi_end_io = target_bdev_end_bio;
+    bio_redirect->bi_private = bio;
+    submit_bio(bio_redirect);
+
+    if (atomic_dec_and_test(&__sbdd.refs_cnt))
+        wake_up(&__sbdd.exitwait);
+}
+
+static struct block_device_operations const __sbdd_bdev_ram_ops = {
 	.owner = THIS_MODULE,
-	.submit_bio = sbdd_submit_bio,
+	.submit_bio = sbdd_submit_bio_ram,
+};
+
+static struct block_device_operations const __sbdd_bdev_target_ops = {
+	.owner = THIS_MODULE,
+	.submit_bio = sbdd_submit_bio_target,
 };
 
 static int sbdd_create(void)
@@ -129,16 +177,22 @@ static int sbdd_create(void)
 		__sbdd.gd = NULL;
 		return ret;
 	}
-
+    
 	/* Configure queue */
 	blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
 	blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
 
 	/* Configure gendisk */
-	__sbdd.gd->fops = &__sbdd_bdev_ops;
 	__sbdd.gd->private_data = &__sbdd;
 	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
-	set_capacity(__sbdd.gd, __sbdd.capacity);
+    if (target_registered && redirect_to_target) {
+        set_capacity(__sbdd.gd, get_capacity(__sbdd.target_bdev->bd_disk));
+	    __sbdd.gd->fops = &__sbdd_bdev_target_ops;
+    } else {
+        set_capacity(__sbdd.gd, __sbdd.capacity);
+	    __sbdd.gd->fops = &__sbdd_bdev_ram_ops;
+    }
+
 	atomic_set(&__sbdd.refs_cnt, 1);
 
 	/*
@@ -160,6 +214,9 @@ static void sbdd_delete(void)
 	atomic_dec_if_positive(&__sbdd.refs_cnt);
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
+    if (__sbdd.target_bdev) {
+        bdev_release(__sbdd.target_bdev_hdl);
+    }
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
 		pr_info("deleting disk\n");
@@ -207,6 +264,57 @@ static void __exit sbdd_exit(void)
 	pr_info("exiting complete\n");
 }
 
+static int target_redirect_set(const char *val, const struct kernel_param *kp) {
+    int ret = 0;
+    atomic_set(&__sbdd.redirecting, 1);
+
+    if (strcmp(__target_bdev_name, "") == 0) {
+        pr_err("Empty target name! Enter /sys/module/sbdd/target_bdev_name.\n");
+        goto redir_out;
+    }
+
+    if(!target_registered) {
+        __sbdd.target_bdev_hdl = bdev_open_by_path(__target_bdev_name, BLK_OPEN_READ | BLK_OPEN_WRITE, NULL, NULL);
+        if (IS_ERR(__sbdd.target_bdev_hdl)) {
+            ret = PTR_ERR(__sbdd.target_bdev_hdl);
+            pr_err("Failed to open bdev with name %s. Aborting...\n", __target_bdev_name);
+            goto redir_out;
+        }
+        __sbdd.target_bdev = __sbdd.target_bdev_hdl->bdev;
+        target_registered = true;
+        pr_info("Target %s registered.\n", __target_bdev_name);
+    }
+    
+    ret = param_set_bool(val, kp);
+
+    if (ret == 0)
+        redirect_to_target = *(bool*) kp->arg;
+
+    if (__sbdd.gd) {
+        if (redirect_to_target) {
+            set_capacity(__sbdd.gd, get_capacity(__sbdd.target_bdev->bd_disk));
+	        __sbdd.gd->fops = &__sbdd_bdev_target_ops;
+        } else {
+            set_capacity(__sbdd.gd, __sbdd.capacity);
+            __sbdd.gd->fops = &__sbdd_bdev_ram_ops;
+        }
+    }
+    
+redir_out:
+    atomic_set(&__sbdd.redirecting, 0);
+    return ret;
+}
+
+static int target_redirect_get(char *buf, const struct kernel_param *kp) {
+    *(bool *) kp->arg = redirect_to_target;
+    return param_get_bool(buf, kp);
+}
+
+static const struct kernel_param_ops target_redirect_ops = {
+    .set = target_redirect_set,
+    .get = target_redirect_get,
+};
+
 /* Called on module loading. Is mandatory. */
 module_init(sbdd_init);
 
@@ -215,6 +323,9 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+
+module_param_cb(redirect, &target_redirect_ops, &redirect_to_target, 0664);
+module_param_string(target_bdev_name, __target_bdev_name, TARGET_NAME_LEN, 0664);
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
