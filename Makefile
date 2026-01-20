@@ -35,10 +35,8 @@
 
 ######## Makefile
 
-libs = 6.8.0-90-generic
-
 default:
-	$(MAKE) -C /lib/modules/$(libs)/build M=$(shell pwd) modules
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) modules
 clean:
-	$(MAKE) -C /lib/modules/$(libs)/build M=$(shell pwd) clean
+	$(MAKE) -C /lib/modules/$(shell uname -r)/build M=$(shell pwd) clean
 	
